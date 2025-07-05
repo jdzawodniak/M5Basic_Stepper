@@ -1,11 +1,54 @@
+# M5Basic_Stepper
 
-This directory is intended for PlatformIO Test Runner and project tests.
+A motor control project using the **M5Stack Basic** and a **TB6600 stepper driver**, with on-screen status display and button-based control.
 
-Unit Testing is a software testing method by which individual units of
-source code, sets of one or more MCU program modules together with associated
-control data, usage procedures, and operating procedures, are tested to
-determine whether they are fit for use. Unit testing finds problems early
-in the development cycle.
+---
 
-More information about PlatformIO Unit Testing:
-- https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+## 🚀 Features
+
+- 🟢 **Button A**: Start/Stop the stepper motor
+- 🔄 **Button B**: Toggle direction (CW/CCW)
+- ⛔ **Button C**: Toggle driver enable/disable
+- 📺 **Display**: Real-time status of motor, direction, and driver state
+- 🧠 Built with `M5Unified` and `PlatformIO`
+
+---
+
+## 🧰 Hardware Used
+
+| Component         | Description                          |
+|------------------|--------------------------------------|
+| M5Stack Basic     | ESP32-based development core         |
+| TB6600 Driver     | Stepper motor driver (5V logic)      |
+| NEMA 23 Stepper   | 57J1856-430-8 or similar              |
+| Power Supply      | 12–24V for motor + 5V logic (if needed) |
+
+---
+
+## 🧩 Wiring Overview
+
+| M5Stack GPIO | TB6600 Pin | Function        |
+|--------------|------------|-----------------|
+| GPIO 5       | ENA-       | Enable (active LOW) |
+| GPIO 17      | DIR-       | Direction        |
+| GPIO 16      | PUL-       | Step pulse       |
+| GND          | ENA-/DIR-/PUL- | Common ground   |
+| 5V (optional)| ENA+       | Logic HIGH (via level shifter if needed) |
+
+> ⚠️ Note: The ESP32 outputs 3.3V logic. To fully disable the TB6600 via ENA+, a 5V HIGH signal is required. A level shifter or transistor circuit may be needed.
+
+---
+
+## 🛠️ Setup Instructions
+
+1. Clone this repo:
+   ```bash
+   git clone https://github.com/jdzawodniak/M5Basic_Stepper.git
+
+M5Basic_Stepper/
+├── src/                  # Main application code
+├── test/                 # Test sketches and experiments
+├── include/              # Header files (if needed)
+├── lib/                  # External libraries
+├── platformio.ini        # PlatformIO config
+└── README.md             # This file
