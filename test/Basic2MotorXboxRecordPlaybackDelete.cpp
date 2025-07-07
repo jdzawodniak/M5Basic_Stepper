@@ -14,17 +14,17 @@ using namespace XboxSeriesXControllerESP32_asukiaaa;
 Preferences         preferences;
 Core                xbox;
 
-// Motor 1 pins
+// TB6600 #1 pins
 static const int    ENABLE1_PIN   = 5;
 static const int    DIR1_PIN      = 17;
 static const int    STEP1_PIN     = 16;
 
-// Motor 2 pins (Grove A & B)
+// TB6600 #2 pins (Grove A & B)
 static const int    ENABLE2_PIN   = 21;
 static const int    DIR2_PIN      = 22;
 static const int    STEP2_PIN     = 26;
 
-static const int    STEP_DELAY_US = 200;
+static const int    STEP_DELAY_US = 200;   // live-drive pulse width
 #define              MAX_SEGMENTS  100
 
 struct Segment {
@@ -33,26 +33,30 @@ struct Segment {
   unsigned long    durationMs;
 };
 
-Segment             segments[MAX_SEGMENTS];
-uint16_t            segmentCount   = 0;
-bool                recordingMode  = false;
-bool                playbackMode   = false;
+static Segment      segments[MAX_SEGMENTS];
+static uint16_t     segmentCount   = 0;
+static bool         recordingMode  = false;
+static bool         playbackMode   = false;
 
-// live‐drive tracking for recording
-volatile long       stepCount1     = 0;
-volatile long       stepCount2     = 0;
-unsigned long       segStartTime   = 0;
-long                segStartCount1, segStartCount2;
-int8_t              lastDir1 = 0, lastDir2 = 0;
+// tracking for recording
+static volatile long  stepCount1     = 0;
+static volatile long  stepCount2     = 0;
+static unsigned long  segStartTime   = 0;
+static long           segStartCount1, segStartCount2;
+static int8_t         lastDir1 = 0, lastDir2 = 0;
 
-// button‐edge storage
-bool                lastLB=false, lastRB=false;
-bool                lastA=false,  lastB=false;
-bool                lastX=false,  lastY=false;
-bool                lastBack=false, lastStart=false;
+// button-edge storage
+static bool lastLB=false, lastRB=false;
+static bool lastA=false,  lastB=false;
+static bool lastX=false,  lastY=false;
+static bool lastBack=false, lastStart=false;
+
+// two-step delete confirmation
+static bool         pendingDelete = false;
+static unsigned long pendingExpiry = 0;   // timeout for confirm
 
 //—————————————————————————————————————————————
-// Low‐Level Motor Control
+// Low-Level Motor Control
 //—————————————————————————————————————————————
 
 void doStep1() {
@@ -71,52 +75,50 @@ void doStep2() {
   stepCount2++;
 }
 
-void enable1(bool en) { digitalWrite(ENABLE1_PIN, en ? LOW : HIGH); }
-void enable2(bool en) { digitalWrite(ENABLE2_PIN, en ? LOW : HIGH); }
+inline void enable1(bool en) { digitalWrite(ENABLE1_PIN, en ? LOW : HIGH); }
+inline void enable2(bool en) { digitalWrite(ENABLE2_PIN, en ? LOW : HIGH); }
 
 //—————————————————————————————————————————————
 // Recording & Playback
 //—————————————————————————————————————————————
 
-void clearCounts() {
+static void clearCounts() {
   stepCount1 = stepCount2 = 0;
 }
 
-void startSegment(int8_t d1, int8_t d2) {
+static void startSegment(int8_t d1, int8_t d2) {
   segStartTime   = millis();
   segStartCount1 = stepCount1;
   segStartCount2 = stepCount2;
 }
 
-void recordSegment(int8_t d1, int8_t d2) {
+static void recordSegment(int8_t d1, int8_t d2) {
   if (segmentCount >= MAX_SEGMENTS) return;
   unsigned long dur = millis() - segStartTime;
   long p1 = stepCount1 - segStartCount1;
   long p2 = stepCount2 - segStartCount2;
-  if (d1!=0 || d2!=0) {
+  if (d1 != 0 || d2 != 0) {
     segments[segmentCount++] = { d1, d2, p1, p2, dur };
     Serial.printf("Recorded #%u: d1=%d p1=%ld d2=%d p2=%ld t=%lums\n",
-                  segmentCount, d1, p1, d2, p2, dur);
+      segmentCount, d1, p1, d2, p2, dur);
   }
   startSegment(d1, d2);
 }
 
-void saveToFlash() {
+static void saveToFlash() {
   preferences.begin("robocan", false);
   preferences.putUShort("count", segmentCount);
-  preferences.putBytes("data", segments,
-                       sizeof(Segment) * segmentCount);
+  preferences.putBytes("data", segments, sizeof(Segment) * segmentCount);
   preferences.end();
   Serial.printf("Saved %u segments\n", segmentCount);
 }
 
-void loadFromFlash() {
+static void loadFromFlash() {
   preferences.begin("robocan", true);
   segmentCount = preferences.getUShort("count", 0);
   if (segmentCount > MAX_SEGMENTS) segmentCount = 0;
   if (segmentCount) {
-    preferences.getBytes("data", segments,
-                         sizeof(Segment) * segmentCount);
+    preferences.getBytes("data", segments, sizeof(Segment) * segmentCount);
     Serial.printf("Loaded %u segments\n", segmentCount);
   } else {
     Serial.println("No saved segments");
@@ -124,15 +126,16 @@ void loadFromFlash() {
   preferences.end();
 }
 
-void deleteSegmentsFromFlash() {
+static void deleteSegmentsFromFlash() {
   preferences.begin("robocan", false);
-  preferences.clear();                  // removes all keys in this namespace
+  preferences.clear();  // erase all keys in this namespace
   preferences.end();
   segmentCount = 0;
   Serial.println("Deleted all saved segments");
 }
 
-void playbackSequence(bool reverse) {
+// playback interleaves steps evenly over recorded duration
+static void playbackSequence(bool reverse) {
   if (!segmentCount) {
     Serial.println("No recording to play");
     return;
@@ -146,20 +149,20 @@ void playbackSequence(bool reverse) {
 
   while (idx != end && playbackMode) {
     auto &s = segments[idx];
+
     // set direction & enable
     digitalWrite(DIR1_PIN, s.dir1 > 0 ? HIGH : LOW);
     digitalWrite(DIR2_PIN, s.dir2 > 0 ? HIGH : LOW);
     enable1(s.dir1 != 0);
     enable2(s.dir2 != 0);
 
-    // interleave steps evenly over duration
     long maxP = max(s.pulses1, s.pulses2);
     if (maxP <= 0) {
       delay(s.durationMs);
     } else {
       unsigned long totalUs  = s.durationMs * 1000UL;
       unsigned long periodUs = totalUs / maxP;
-      for (long k=0; k<maxP && playbackMode; k++) {
+      for (long k = 0; k < maxP && playbackMode; k++) {
         unsigned long t0 = micros();
         if (k < s.pulses1) digitalWrite(STEP1_PIN, HIGH);
         if (k < s.pulses2) digitalWrite(STEP2_PIN, HIGH);
@@ -172,7 +175,7 @@ void playbackSequence(bool reverse) {
           delayMicroseconds(periodUs - elapsed);
         }
 
-        xbox.onLoop();  // allow abort check
+        xbox.onLoop();
         if (xbox.xboxNotif.btnX) {
           Serial.println("Playback aborted");
           playbackMode = false;
@@ -195,7 +198,13 @@ void playbackSequence(bool reverse) {
 // Display & Setup
 //—————————————————————————————————————————————
 
-void updateDisplay() {
+static void updateDisplay() {
+  // If a delete-prompt is active and not yet expired, skip normal display
+  if (pendingDelete && millis() < pendingExpiry) {
+    return;
+  }
+  // Otherwise show normal status
+  pendingDelete = false;
   M5.Lcd.fillScreen(BLACK);
   M5.Lcd.setTextSize(2);
   M5.Lcd.setTextColor(WHITE, BLACK);
@@ -213,12 +222,14 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  // configure motor pins
   pinMode(ENABLE1_PIN, OUTPUT);
   pinMode(DIR1_PIN,    OUTPUT);
   pinMode(STEP1_PIN,   OUTPUT);
   pinMode(ENABLE2_PIN, OUTPUT);
   pinMode(DIR2_PIN,    OUTPUT);
   pinMode(STEP2_PIN,   OUTPUT);
+
   digitalWrite(DIR1_PIN, HIGH);
   digitalWrite(DIR2_PIN, HIGH);
   enable1(false);
@@ -227,6 +238,7 @@ void setup() {
   xbox.begin();
   loadFromFlash();
 
+  // pairing prompt
   M5.Lcd.setTextSize(2);
   M5.Lcd.setTextColor(WHITE, BLACK);
   M5.Lcd.setCursor(0, 0);
@@ -251,16 +263,16 @@ void loop() {
   }
 
   // read buttons
-  bool curLB    = xbox.xboxNotif.btnLB;     // record start/cancel
+  bool curLB    = xbox.xboxNotif.btnLB;     // record toggle
   bool curRB    = xbox.xboxNotif.btnRB;     // record segment
   bool curA     = xbox.xboxNotif.btnA;      // play forward
   bool curB     = xbox.xboxNotif.btnB;      // play reverse
   bool curX     = xbox.xboxNotif.btnX;      // abort playback
   bool curY     = xbox.xboxNotif.btnY;      // delete segments
-  bool curBack  = xbox.xboxNotif.btnSelect; // save
-  bool curStart = xbox.xboxNotif.btnStart;  // load
+  bool curBack  = xbox.xboxNotif.btnSelect; // save flash
+  bool curStart = xbox.xboxNotif.btnStart;  // load flash
 
-  // 1) LB → toggle recording
+  // 1) LB: toggle recording
   if (curLB && !lastLB) {
     if (!recordingMode) {
       Serial.println("> RECORD START");
@@ -274,13 +286,15 @@ void loop() {
     }
   }
 
-  // 2) RB → record current segment
+  // 2) RB: finalize current segment
   if (curRB && !lastRB && recordingMode) {
     recordSegment(lastDir1, lastDir2);
   }
 
   // 3) Save / Load
-  if (curBack  && !lastBack  && !recordingMode && !playbackMode) saveToFlash();
+  if (curBack && !lastBack && !recordingMode && !playbackMode) {
+    saveToFlash();
+  }
   if (curStart && !lastStart && !recordingMode && !playbackMode) {
     loadFromFlash();
     updateDisplay();
@@ -296,7 +310,7 @@ void loop() {
     updateDisplay();
   }
 
-  // 5) Abort X
+  // 5) Abort playback X
   if (curX && !lastX && playbackMode) {
     Serial.println("> PLAY ABORT");
     playbackMode = false;
@@ -305,35 +319,62 @@ void loop() {
     updateDisplay();
   }
 
-  // 6) Delete saved segments → Y (when idle)
+  // 6) Y: two-step delete confirmation
   if (curY && !lastY && !recordingMode && !playbackMode) {
-    deleteSegmentsFromFlash();
+    if (!pendingDelete) {
+      // first press: prompt operator
+      pendingDelete   = true;
+      pendingExpiry   = millis() + 2000;  // 2 s to confirm
+      M5.Lcd.fillScreen(BLACK);
+      M5.Lcd.setTextSize(2);
+      M5.Lcd.setTextColor(YELLOW, BLACK);
+      M5.Lcd.setCursor(0, 20);
+      M5.Lcd.println("Press Y again to");
+      M5.Lcd.println("confirm DELETE");
+    }
+    else {
+      // second press: delete
+      deleteSegmentsFromFlash();
+      M5.Lcd.fillScreen(BLACK);
+      M5.Lcd.setTextSize(3);
+      M5.Lcd.setTextColor(RED, BLACK);
+      M5.Lcd.setCursor(0, 30);
+      M5.Lcd.println("DELETED ALL");
+      delay(800);
+      pendingDelete = false;
+      updateDisplay();
+    }
+  }
+  // timeout pendingDelete if not confirmed
+  if (pendingDelete && millis() > pendingExpiry) {
+    pendingDelete = false;
     updateDisplay();
   }
 
-  // LIVE DRIVE whenever not in playback
+  // LIVE DRIVE if not playing back
   if (!playbackMode) {
     float vy = float(xbox.xboxNotif.joyLVert) /
                XboxControllerNotificationParser::maxJoy;
     float vx = float(xbox.xboxNotif.joyRHori) /
                XboxControllerNotificationParser::maxJoy;
     int8_t d1 = 0, d2 = 0;
-    if      (vy > 0.6) d1=d2=+1;
-    else if (vy < 0.4) d1=d2=-1;
-    if      (vx > 0.6) d1=0;
-    else if (vx < 0.4) d2=0;
+    if      (vy > 0.6) d1 = d2 = +1;
+    else if (vy < 0.4) d1 = d2 = -1;
+    if      (vx > 0.6) d1 = 0;
+    else if (vx < 0.4) d2 = 0;
 
-    // record on direction change
-    if (recordingMode && (d1!=lastDir1 || d2!=lastDir2)) {
+    // recording: on direction change
+    if (recordingMode && (d1 != lastDir1 || d2 != lastDir2)) {
       recordSegment(lastDir1, lastDir2);
       startSegment(d1, d2);
     }
-    lastDir1=d1; lastDir2=d2;
+    lastDir1 = d1; lastDir2 = d2;
 
-    digitalWrite(DIR1_PIN, d1>0?HIGH:LOW);
-    digitalWrite(DIR2_PIN, d2>0?HIGH:LOW);
-    enable1(d1!=0);
-    enable2(d2!=0);
+    // apply live drive
+    digitalWrite(DIR1_PIN, d1 > 0 ? HIGH : LOW);
+    digitalWrite(DIR2_PIN, d2 > 0 ? HIGH : LOW);
+    enable1(d1 != 0);
+    enable2(d2 != 0);
     if (d1) doStep1();
     if (d2) doStep2();
   }
@@ -344,9 +385,9 @@ void loop() {
   lastX     = curX;     lastY     = curY;
   lastBack  = curBack;  lastStart = curStart;
 
-  // refresh display occasionally
+  // periodically refresh display
   static unsigned long t0 = 0;
-  if (millis() - t0 > 200) {
+  if (millis() - t0 > 200 && !pendingDelete) {
     updateDisplay();
     t0 = millis();
   }
