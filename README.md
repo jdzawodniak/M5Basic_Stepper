@@ -53,7 +53,7 @@ This firmware runs two TB6600 stepper drivers from an Xbox BLE controller on an 
      3. Abort with **X** at any time  
    - Drivers disabled at end of playback  
 
----
+------
 
 ## 3. Button & Stick Mapping
 
